@@ -22,11 +22,26 @@ $headers   = @{
 }
 
 function Get-GitHubFiles {
-    $treeUrl = "https://api.github.com/repos/$Repo/git/trees/$branch`?recursive=1"
-    $tree = Invoke-RestMethod -Uri $treeUrl -Headers $headers -Method Get
-    $map = @{}
-    $tree.tree | Where-Object { $_.type -eq 'blob' } | ForEach-Object { $map[$_.path] = $_.sha }
-    return $map
+    try {
+        $treeUrl = "https://api.github.com/repos/$Repo/git/trees/$branch`?recursive=1"
+        $tree = Invoke-RestMethod -Uri $treeUrl -Headers $headers -Method Get
+        $map = @{}
+        $tree.tree | Where-Object { $_.type -eq 'blob' } | ForEach-Object { $map[$_.path] = $_.sha }
+        return $map
+    } catch {
+        $statusCode = 0
+        if ($null -ne $_.Exception -and $null -ne $_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+        $errMsg = $_.ErrorDetails.Message
+        if (!$errMsg -and $null -ne $_.Exception) { $errMsg = $_.Exception.Message }
+        
+        if ($statusCode -eq 409 -or ($errMsg -and $errMsg -match 'empty')) {
+            Write-Host "Repository is empty or uninitialized. Proceeding with empty file list." -ForegroundColor Yellow
+            return @{}
+        }
+        throw $_
+    }
 }
 
 function Get-BlobSha($bytes) {
@@ -122,8 +137,16 @@ $excludeFiles = @(
 )
 
 $excludePatterns = @(
-    '*reel*',
     '*bigdata*'
+)
+
+$excludeDirNames = @(
+    'node_modules',
+    'user_data',
+	'user_data_old',
+	'downloads',
+    '__pycache__',
+    'pdf_screenshot'
 )
 
 $allExcludePaths = @() + $ExtraExcludePaths
@@ -138,8 +161,15 @@ function Test-ExcludePath($repoPath) {
     return $false
 }
 
+$firebaseAllowList = @(
+    'send.html',
+	'app.js'
+)
+
 function Test-FirebaseConfig($localPath, $repoPath) {
     try {
+        $filename = Split-Path $repoPath -Leaf
+        if ($filename -in $firebaseAllowList) { return $false }
         $content = [IO.File]::ReadAllText($localPath)
         if ($content -match 'const firebaseConfig\s*=\s*\{[^}]*apiKey\s*:\s*"') {
             Write-Host "  [SKIP] $repoPath (contains firebaseConfig apiKey)" -ForegroundColor DarkYellow
@@ -149,27 +179,48 @@ function Test-FirebaseConfig($localPath, $repoPath) {
     return $false
 }
 
-Get-ChildItem -Path $Root -File -Recurse | ForEach-Object {
-    $localPath = $_.FullName
-    $repoPath  = $localPath.Substring($Root.Length + 1) -replace '\\', '/'
-    if ($repoPath -in $excludeFiles) {
-        return
+function Test-ExcludeDir($repoPath) {
+    $dirs = $repoPath.Split('/')
+    foreach ($dn in $excludeDirNames) {
+        if ($dirs -contains $dn) { return $true }
     }
-    $filename = Split-Path $repoPath -Leaf
-    $matched = $false
-    foreach ($p in $excludePatterns) { if ($filename -like $p) { $matched = $true; break } }
-    if ($matched) {
-        Write-Host "  [SKIP] $repoPath (excluded filename)" -ForegroundColor DarkYellow
-        return
+    return $false
+}
+
+$dirQueue = New-Object System.Collections.Queue
+$dirQueue.Enqueue($Root)
+
+while ($dirQueue.Count -gt 0) {
+    $currentDir = $dirQueue.Dequeue()
+
+    foreach ($exDir in $excludeDirNames) {
+        $childDir = Join-Path $currentDir $exDir
+        if (Test-Path $childDir) {
+            $relPath = $childDir.Substring($Root.Length + 1) -replace '\\', '/'
+            Write-Host "  [SKIP DIR] $relPath" -ForegroundColor DarkYellow
+        }
     }
-    if (Test-ExcludePath $repoPath) {
-        return
+
+    Get-ChildItem -Path $currentDir -Directory | Where-Object { $_.Name -notin $excludeDirNames } | ForEach-Object {
+        $dirQueue.Enqueue($_.FullName)
     }
-    if (Test-FirebaseConfig $localPath $repoPath) {
-        return
+
+    Get-ChildItem -Path $currentDir -File | ForEach-Object {
+        $localPath = $_.FullName
+        $repoPath  = $localPath.Substring($Root.Length + 1) -replace '\\', '/'
+        if ($repoPath -in $excludeFiles) { return }
+        $filename = Split-Path $repoPath -Leaf
+        $matched = $false
+        foreach ($p in $excludePatterns) { if ($filename -like $p) { $matched = $true; break } }
+        if ($matched) {
+            Write-Host "  [SKIP] $repoPath (excluded filename)" -ForegroundColor DarkYellow
+            return
+        }
+        if (Test-ExcludePath $repoPath) { return }
+        if (Test-FirebaseConfig $localPath $repoPath) { return }
+        $null = $localPaths.Add($repoPath)
+        $null = Upload-File $localPath $repoPath $ghShaMap
     }
-    $null = $localPaths.Add($repoPath)
-    $null = Upload-File $localPath $repoPath $ghShaMap
 }
 
 Write-Host 'Checking for orphaned files on GitHub...' -ForegroundColor Cyan
@@ -186,6 +237,9 @@ foreach ($path in $ghShaMap.Keys) {
         continue
     }
     if ($path -in $allExcludePaths) {
+        continue
+    }
+    if (Test-ExcludeDir $path) {
         continue
     }
     if (-not $localPaths.Contains($path)) {
