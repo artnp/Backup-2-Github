@@ -133,20 +133,24 @@ $localPaths = [System.Collections.Generic.HashSet[string]]::new()
 
 $excludeFiles = @(
     'github_upload.ps1',
-    'admin-local.html'
+    'secure_config.enc',
+    'admin-local.html',
+    'withdraw_error.log'
 )
 
 $excludePatterns = @(
-    '*bigdata*'
+    '*bigdata*',
+    '*.log'
 )
 
 $excludeDirNames = @(
     'node_modules',
     'user_data',
-	'user_data_old',
-	'downloads',
+    'user_data_old',
+    'downloads',
     '__pycache__',
-    'pdf_screenshot'
+    'pdf_screenshot',
+    'ลับไม่ต้องอัพโหลด_Binance_Bot'
 )
 
 $allExcludePaths = @() + $ExtraExcludePaths
@@ -208,8 +212,11 @@ while ($dirQueue.Count -gt 0) {
     Get-ChildItem -Path $currentDir -File | ForEach-Object {
         $localPath = $_.FullName
         $repoPath  = $localPath.Substring($Root.Length + 1) -replace '\\', '/'
-        if ($repoPath -in $excludeFiles) { return }
-        $filename = Split-Path $repoPath -Leaf
+        $filename  = Split-Path $repoPath -Leaf
+        if ($repoPath -in $excludeFiles -or $filename -in $excludeFiles) {
+            Write-Host "  [SKIP] $repoPath (excluded file)" -ForegroundColor DarkYellow
+            return
+        }
         $matched = $false
         foreach ($p in $excludePatterns) { if ($filename -like $p) { $matched = $true; break } }
         if ($matched) {
@@ -227,10 +234,10 @@ Write-Host 'Checking for orphaned files on GitHub...' -ForegroundColor Cyan
 
 $deleted = 0
 foreach ($path in $ghShaMap.Keys) {
-    if ($path -in $excludeFiles) {
+    $ghFilename = Split-Path $path -Leaf
+    if ($path -in $excludeFiles -or $ghFilename -in $excludeFiles) {
         continue
     }
-    $ghFilename = Split-Path $path -Leaf
     $matched = $false
     foreach ($p in $excludePatterns) { if ($ghFilename -like $p) { $matched = $true; break } }
     if ($matched) {
